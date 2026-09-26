@@ -39,6 +39,12 @@ class MHALayout:
             raise ValueError("KV layout dimensions must be positive")
         if self.kv_heads % self.tp_size:
             raise ValueError("initial recorder requires KV heads divisible by TP")
+        # This exporter uses the replay contract's one-slice value_sizes form.
+        # The pinned Mooncake CacheLib client splits above Slab::kSize - 16.
+        if self.object_bytes > (4 << 20) - 16:
+            raise ValueError(
+                "KV object exceeds one Mooncake slice; reduce page size or extend the exporter for multi-slice objects"
+            )
 
     @property
     def object_bytes(self):

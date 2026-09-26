@@ -1,5 +1,11 @@
+import pytest
 from sglang_simulator.master_trace.storage import MHALayout, SharedStorage
 from sglang_simulator.master_trace.trace import TraceRecorder
+
+
+def test_rejects_layout_that_would_require_multiple_mooncake_slices():
+    with pytest.raises(ValueError, match="exceeds one Mooncake slice"):
+        MHALayout("Qwen/Qwen3-8B", 36, 8, 128, 2, 256, 1)
 
 
 def test_cross_instance_reuse_waits_for_commit_and_evicts():

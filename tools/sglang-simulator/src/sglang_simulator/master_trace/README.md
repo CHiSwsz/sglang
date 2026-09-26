@@ -6,7 +6,9 @@ It exports RPC intent for a separate Mooncake replay tool. No Mooncake master,
 GPU, model weights or payload transfer is used during generation.
 
 The supported layout is homogeneous MHA, BF16, page-first, PP=1, CP=1, with KV
-heads divisible by TP. A singleton real CPU/Gloo group executes native scheduler
+heads divisible by TP. Each K/V object must fit one Mooncake slice (at most
+4 MiB minus 16 bytes for the pinned CacheLib build); larger objects are rejected.
+A singleton real CPU/Gloo group executes native scheduler
 and HiCache decisions; each simulated instance's storage operations expand into
 the physical K/V keys of its TP ranks. TP ranks are not independently simulated.
 MLA, hybrid sidecar pools, group semantics, heterogeneous layouts and failover
