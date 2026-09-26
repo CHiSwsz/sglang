@@ -16,6 +16,7 @@ from array import array
 from dataclasses import asdict
 from pathlib import Path
 
+from .arrivals import SessionTimeline
 from .storage import MHALayout, SharedStorage
 from .trace import TraceRecorder
 
@@ -52,12 +53,13 @@ class Cluster:
         self.state_manager = StateManager
         self.scheduler_hook = C_SchedulerHook
         self.config = config
-        self.rows = rows
+        self.timeline = SessionTimeline(rows)
+        self.rows = list(self.timeline.requests.values())
         self.now = 0
         self.queue = []
         self.sequence = 0
         self.completed = {}
-        self.request_rows = {}
+        self.request_rows = self.timeline.requests
         self.iterations = 0
         model = json.loads((Path(config["model_path"]) / "config.json").read_text())
         self.layout = MHALayout(
@@ -149,10 +151,8 @@ class Cluster:
             )
             print(f"Initialized instance {index + 1}/{config['instances']}", flush=True)
         self.initial_state = self.capture_state()
-        for ordinal, row in enumerate(rows):
+        for rid, row in self.timeline.initial:
             when = round(row["timestamp"] * 1000)
-            rid = f"request-{ordinal:08d}"
-            self.request_rows[rid] = row
             self.enqueue(when, "arrival", (rid, row))
 
     def capture_state(self):
@@ -188,6 +188,11 @@ class Cluster:
                     "finished_us": self.now,
                     "output_ids": list(req.output_ids),
                 }
+                following = self.timeline.complete(req.rid, self.now)
+                if following is not None:
+                    self.enqueue(
+                        round(following[1]["timestamp"] * 1000), "arrival", following
+                    )
                 if len(self.completed) % 1024 == 0:
                     print(
                         f"Completed {len(self.completed)}/{len(self.rows)} requests at {self.now / 1e6:.3f}s",
@@ -316,22 +321,7 @@ class Cluster:
             expected = self.request_rows[rid]["output_len"]
             if completed["output_ids"] != [1] * expected:
                 raise RuntimeError(f"unexpected simulated response for {rid}")
-        by_session = {}
-        for rid, row in self.request_rows.items():
-            meta = row.get("metadata", {})
-            session, turn = meta.get("session_id"), meta.get("turn", 0)
-            if session is not None:
-                by_session.setdefault(session, {})[turn] = (rid, row)
-        for turns in by_session.values():
-            for turn, (rid, row) in turns.items():
-                if (
-                    turn
-                    and round(row["timestamp"] * 1000)
-                    < self.completed[turns[turn - 1][0]]["finished_us"]
-                ):
-                    raise RuntimeError(
-                        f"session arrival precedes previous completion: {rid}; increase turn interval"
-                    )
+        self.timeline.validate()
 
     def report(self):
         from sglang_simulator.simulation.sglang.req_stats_manager import (
@@ -346,6 +336,8 @@ class Cluster:
             "requests": [
                 {
                     "id": rid,
+                    "arrival_us": round(self.request_rows[rid]["timestamp"] * 1000),
+                    "session": self.request_rows[rid].get("metadata", {}),
                     **completed,
                     **asdict(request_stats_manager.get_req_stats(rid)),
                 }
@@ -364,17 +356,21 @@ def main():
     config = json.loads(args.config.read_text())
     for field in ("model_path", "sim_config_path"):
         config[field] = str((args.config.parent / config[field]).resolve())
-    rows = [
-        json.loads(line)
-        for line in args.requests.read_text().splitlines()
-        if line.strip()
-    ]
+    with args.requests.open() as stream:
+        rows = [json.loads(line) for line in stream if line.strip()]
     start = time.monotonic()
     cluster = Cluster(config, rows, args.output_dir)
     cluster.recorder.metadata["input_sha256"] = hashlib.sha256(
         args.requests.read_bytes()
     ).hexdigest()
     cluster.run()
+    resolved_path = args.output_dir / "requests.autobench.jsonl"
+    with resolved_path.open("x") as stream:
+        for row in cluster.timeline.resolved_rows():
+            stream.write(json.dumps(row, separators=(",", ":")) + "\n")
+    cluster.recorder.metadata["resolved_requests_sha256"] = hashlib.sha256(
+        resolved_path.read_bytes()
+    ).hexdigest()
     cluster.recorder.metadata["storage_stats"] = cluster.storage.stats
     cluster.recorder.write(args.output_dir / "master-rpc.jsonl")
     report = cluster.report()

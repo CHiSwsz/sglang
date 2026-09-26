@@ -25,25 +25,50 @@ predictor. The model path can point to `test/assets/qwen3-8b` with dummy weights
 
 ```bash
 python -m sglang_simulator.master_trace.workload \
-  --config /outside/repo/workload.json --output /outside/repo/requests.jsonl
+  --config /outside/repo/workload.json --output /outside/repo/session-plan.jsonl
 python -m sglang_simulator.master_trace.cluster \
-  --config /outside/repo/cluster.json --requests /outside/repo/requests.jsonl \
+  --config /outside/repo/cluster.json --requests /outside/repo/session-plan.jsonl \
   --output-dir /outside/repo/recording
 ```
 
 The output directory must not exist. Workload configuration, for example:
 
 ```json
-{"seed":42,"sessions":12,"session_rate":8,"length_variation":0,"mean_new_tokens_per_round":[1024,256,256],"mean_return_tokens_per_round":[8,8,8],"mean_inter_round_interval_ms":[0,2000,2000],"round_ratios":[0,0,1]}
+{"seed":42,"session_arrival_duration_s":10,"session_rate":2,"length_variation":0.2,"mean_new_tokens_per_round":[1024,256,256],"mean_return_tokens_per_round":[8,12,16],"mean_think_time_ms":[0,1000,2000],"think_time_cv":1.0,"round_ratios":[2,3,5]}
 ```
 
-This borrows bench_mix's weighted session lengths and accumulated conversation
-history. It exports token IDs in AutoBench JSONL: `prompt`, `prompt_len`,
-`output_len`, `timestamp` in milliseconds and session/turn metadata. New sessions
-arrive as a Poisson process. Later turns append the preceding simulated response
-(token 1) and new random input. Turn timestamps are open-loop offsets; generation
-fails if a later turn would arrive before the previous response completes.
+This borrows bench_mix's weighted session lengths, accumulated history and
+completion-relative followups, not its exact arrival generator or distributions.
+New sessions arrive as a Poisson process throughout `session_arrival_duration_s`;
+alternatively set a positive `sessions` count, but not both. The simulation drains
+all existing sessions after new arrivals stop. Each session independently samples
+its total number of rounds using `round_ratios`. Input and output lengths vary
+uniformly around their per-round means by `length_variation`.
+
+For every later turn, think time is sampled from a lognormal distribution with
+the configured arithmetic `mean_think_time_ms` and coefficient of variation
+`think_time_cv` (standard deviation / mean). Index zero is unused. A zero mean
+allows immediate followups; CV zero gives a fixed wait. These are explicit
+synthetic assumptions, not parameters fitted to production traffic. Random
+new-session arrivals use a separate stream from lengths and think times.
+
+The session plan contains token IDs, `prompt_len`, `output_len` and session/turn
+metadata. Only first turns have absolute millisecond `timestamp` values. Later
+turns have `timestamp: null`, `arrival_mode: after_completion` and a sampled
+`think_time_us` in metadata. This plan is **not yet an AutoBench arrival trace**.
+The cluster schedules each followup at the previous simulated response completion
+plus its think time. Slower responses therefore delay that session's next turn,
+while independent new-session arrivals continue. Later prompts append the previous
+simulated response (token 1) and new random input; response tokens are validated.
 No semantic equivalence between different token strings is assumed.
+
+After simulation, `requests.autobench.jsonl` contains every resolved absolute
+timestamp, sorted by arrival, in AutoBench format. It can be loaded as fixed
+arrivals without adding think time again. The input plan and resolved trace have
+separate SHA-256 hashes in the RPC header. Existing absolute AutoBench inputs
+remain supported. For reproducing old phase-separated experiments only, the
+legacy `mean_inter_round_interval_ms` option retains fixed arrival offsets and
+rejects overlap with an unfinished previous turn; do not combine it with think time.
 
 Cluster configuration, for example:
 
@@ -92,7 +117,8 @@ has its own microsecond origin. Serving client count does not determine storage
 capacity. Segment addresses and IDs are supplied by the real replayer, and no
 payload memory is allocated there. Dynamic membership is outside this version.
 
-Outputs are `master-rpc.jsonl` and `simulation.json`, including configuration,
-input SHA-256, completed requests, logical duration, and L3 counts. Keep these
+Outputs are `master-rpc.jsonl`, `requests.autobench.jsonl` and `simulation.json`,
+including configuration, input/resolved SHA-256, actual arrivals, session metadata,
+completed requests, logical duration, and L3 counts. Keep these
 artifacts outside the Mooncake repository. Archive source revisions and the
 timing configuration alongside them, then stop this process before benchmarking.
