@@ -1612,7 +1612,7 @@ class ModelRunner:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
         # Derive the LOCAL num_token_non_padded from the GLOBAL scalar. sharded is
-        # cleared for DSACPLayerCommunicator-style CP (DSA, MLA): those flavors
+        # cleared for DSA and MLA prefill CP: those flavors
         # already feed a zigzag-split rank-local layout whose token count should
         # not be further divided by attn_tp_size, so they keep the full count.
         # MHA-arch prefill CP (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated
