@@ -1,0 +1,116 @@
+"""Version 2 RPC-intent export with explicit, independent storage lifecycle.
+
+Phases are replayed in order with completion barriers. Each phase has its own
+relative microsecond clock. Mount time is consequently measured independently
+of serving traffic, and teardown cannot race unfinished writes or lookups.
+"""
+
+import json
+from pathlib import Path
+
+
+class TraceRecorder:
+    def __init__(self, metadata: dict):
+        self.metadata = metadata
+        self.events = []
+        self._counter = 0
+        self._storage = []
+        self._writers = {}
+        self._readers = {}
+
+    def emit(self, timestamp_us, client_id, op, *, phase="workload", **fields):
+        if timestamp_us < 0:
+            raise ValueError("negative event time")
+        event_id = f"e{self._counter}"
+        self._counter += 1
+        keys = fields.get("keys", ())
+        if keys:
+            dependencies = set(fields.get("depends_on", ()))
+            read = op in ("BatchExistKey", "BatchGetReplicaList")
+            for key in keys:
+                if key in self._writers:
+                    dependencies.add(self._writers[key])
+                if read:
+                    self._readers.setdefault(key, set()).add(event_id)
+                else:
+                    dependencies.update(self._readers.pop(key, ()))
+                    self._writers[key] = event_id
+            if dependencies:
+                fields["depends_on"] = sorted(
+                    dependencies, key=lambda value: int(value[1:])
+                )
+        self.events.append(
+            {
+                "id": event_id,
+                "phase": phase,
+                "timestamp_us": round(timestamp_us),
+                "client_id": client_id,
+                "op": op,
+                **fields,
+            }
+        )
+        return event_id
+
+    def setup(self, request_clients, storage_nodes, bytes_per_node):
+        if storage_nodes < 1 or bytes_per_node < 1 or self.events:
+            raise ValueError("setup requires positive capacity and an empty recorder")
+        storage_clients = [f"storage-{i:04d}" for i in range(storage_nodes)]
+        registrations = {}
+        for client in list(request_clients) + storage_clients:
+            # Empty remount is the master's initial client-liveness handshake;
+            # request-only clients contribute no storage capacity.
+            registrations[client] = self.emit(
+                0, client, "ReMountSegment", phase="setup", segments=[]
+            )
+        for index, client in enumerate(storage_clients):
+            segment_id = f"segment-{index:04d}"
+            self.emit(
+                0,
+                client,
+                "MountSegment",
+                phase="setup",
+                segment_id=segment_id,
+                size_bytes=bytes_per_node,
+                depends_on=[registrations[client]],
+            )
+            self._storage.append((client, segment_id))
+        self.metadata["storage"] = {
+            "nodes": storage_nodes,
+            "bytes_per_node": bytes_per_node,
+            "total_bytes": storage_nodes * bytes_per_node,
+            "lifecycle": "mount before workload; drain workload; unmount all segments",
+            "payload": "metadata_only",
+        }
+
+    def write(self, path: Path):
+        if not self._storage:
+            raise ValueError("storage setup is required")
+        events = list(self.events)
+        for index, (client, segment_id) in enumerate(self._storage):
+            events.append(
+                {
+                    "id": f"unmount-{index}",
+                    "phase": "teardown",
+                    "timestamp_us": 0,
+                    "client_id": client,
+                    "op": "UnmountSegment",
+                    "segment_id": segment_id,
+                }
+            )
+        phase_order = {"setup": 0, "workload": 1, "teardown": 2}
+        events.sort(key=lambda e: (phase_order[e["phase"]], e["timestamp_us"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "type": "master_rpc_trace",
+                        "version": 2,
+                        "time_unit": "us",
+                        "metadata": self.metadata,
+                    }
+                )
+                + "\n"
+            )
+            for event in events:
+                stream.write(json.dumps(event, separators=(",", ":")) + "\n")

@@ -1,6 +1,7 @@
 import heapq
 import importlib
 import json
+import math
 import os
 import time
 from dataclasses import asdict
@@ -34,6 +35,23 @@ from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
 
 logger = get_logger("sgl_simulator")
+
+
+def modeled_cpu_overhead(measured_seconds: float) -> float:
+    """Optionally remove host CPU contention from an offline trace's clock."""
+    value = os.environ.get("SGLANG_SIMULATOR_CPU_OVERHEAD_US")
+    if value is None:
+        return max(measured_seconds, 0.0)
+    seconds = float(value) / 1_000_000
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(
+            "SGLANG_SIMULATOR_CPU_OVERHEAD_US must be finite and nonnegative"
+        )
+    return seconds
+
+
+def uses_external_clock() -> bool:
+    return os.environ.get("SGLANG_SIMULATOR_EXTERNAL_CLOCK") == "1"
 
 
 def simulation_mode_log_message(mode: SimulationMode) -> str:
@@ -105,6 +123,7 @@ class ReqDispatcher:
         ] = []  # tuple(created time, salt, request)
         self.offline_recv_all_requests = False
         self.profile_active = False
+        self.arrival_sequence = 0
 
     @staticmethod
     def simulation_created_time_s(simulation_args: dict) -> float:
@@ -122,6 +141,7 @@ class ReqDispatcher:
         self.immediate_release_requests.clear()
         self.future_queue.clear()
         self.offline_recv_all_requests = False
+        self.arrival_sequence = 0
 
     def add(self, reqs: list):
         if self.mode == SimulationMode.BLOCKING:
@@ -162,10 +182,11 @@ class ReqDispatcher:
                     (
                         sim_params.get("queue_start")
                         or self.simulation_created_time_s(sim_params),
-                        time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
+                        self.arrival_sequence,
                         req,
                     )
                 )
+                self.arrival_sequence += 1
 
             if len(self.future_queue) != 0:
                 _, _, gen_req = self.future_queue[-1]
@@ -382,13 +403,18 @@ class C_SchedulerHook(BaseHook):
                         pass
             elif len(running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
-                StateManager.step_global_clock(0.005)
+                if not uses_external_clock():
+                    StateManager.step_global_clock(0.005)
                 StateManager.set_current_inference_dur(0.005)
             else:
                 # Idle stage, there are some requests pendding in the future queue.
-                if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE and (
-                    C_SchedulerHook.REQ_DISPATCHER.has_next()
-                    and len(running_batch.reqs) == 0
+                if (
+                    not uses_external_clock()
+                    and C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE
+                    and (
+                        C_SchedulerHook.REQ_DISPATCHER.has_next()
+                        and len(running_batch.reqs) == 0
+                    )
                 ):
                     next_created_time = (
                         C_SchedulerHook.REQ_DISPATCHER.next_req_from_future_ts()
@@ -501,16 +527,17 @@ class C_SchedulerHook(BaseHook):
                     visible_l2_load_dur,
                 )
 
-                StateManager.step_global_clock(visible_l2_load_dur)
-                StateManager.step_global_clock(current_inference_dur)
+                if not uses_external_clock():
+                    StateManager.step_global_clock(visible_l2_load_dur)
+                    StateManager.step_global_clock(current_inference_dur)
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
-                cpu_overhead = max(
-                    now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur,
-                    0.0,
+                cpu_overhead = modeled_cpu_overhead(
+                    now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur
                 )
-                StateManager.step_global_clock(cpu_overhead)
+                if not uses_external_clock():
+                    StateManager.step_global_clock(cpu_overhead)
                 StateManager.set_last_real_time_ts(now)
 
                 request_response_time = StateManager.get_global_clock()
@@ -543,9 +570,10 @@ class C_SchedulerHook(BaseHook):
                 )
             else:
                 now = time.time()
-                StateManager.step_global_clock(
-                    now - StateManager.get_last_real_time_ts()
-                )
+                if not uses_external_clock():
+                    StateManager.step_global_clock(
+                        modeled_cpu_overhead(now - StateManager.get_last_real_time_ts())
+                    )
                 StateManager.set_last_real_time_ts(now)
 
             return ret

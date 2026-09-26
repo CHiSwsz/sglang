@@ -1,3 +1,4 @@
+import os
 from queue import Empty, Queue
 from typing import Optional
 
@@ -276,6 +277,12 @@ class C_HiCacheController(BaseHook):
         target.storage_hit_query = wrapped_storage_hit_query
         if hasattr(target, "_storage_hit_query"):
             target._storage_hit_query = wrapped_storage_hit_query
+        if os.environ.get("SGLANG_SIMULATOR_EXTERNAL_CLOCK") == "1":
+            from sglang_simulator.master_trace.backend import (
+                install_recording_controller,
+            )
+
+            install_recording_controller(target)
 
 
 class C_HybridCacheController(BaseHook):
@@ -309,3 +316,9 @@ class C_HybridCacheController(BaseHook):
 
         target.__init__ = wrapped_init
         target._storage_hit_query = wrapped_storage_hit_query
+        if os.environ.get("SGLANG_SIMULATOR_EXTERNAL_CLOCK") == "1":
+            from sglang_simulator.master_trace.backend import (
+                install_recording_controller,
+            )
+
+            install_recording_controller(target)

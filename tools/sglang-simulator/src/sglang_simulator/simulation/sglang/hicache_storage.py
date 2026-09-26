@@ -16,6 +16,10 @@ class C_StorageBackendFactory(BaseHook):
     @classmethod
     def hook(cls, target):
         def override_create_backend(cls, *args, **kwargs):
+            if os.environ.get("SGLANG_SIMULATOR_EXTERNAL_CLOCK") == "1":
+                from sglang_simulator.master_trace.backend import create_backend
+
+                return create_backend()
             logger.info("Creating hijacked cache storage backend.")
             return MockHiCacheStorage()
 
