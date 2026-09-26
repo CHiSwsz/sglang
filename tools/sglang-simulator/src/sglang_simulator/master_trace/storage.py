@@ -37,8 +37,8 @@ class MHALayout:
             < 1
         ):
             raise ValueError("KV layout dimensions must be positive")
-        if self.kv_heads % self.tp_size:
-            raise ValueError("initial recorder requires KV heads divisible by TP")
+        if self.kv_heads % self.tp_size and self.tp_size % self.kv_heads:
+            raise ValueError("KV heads and TP must divide one another")
         # This exporter uses the replay contract's one-slice value_sizes form.
         # The pinned Mooncake CacheLib client splits above Slab::kSize - 16.
         if self.object_bytes > (4 << 20) - 16:
@@ -52,7 +52,7 @@ class MHALayout:
         # layers for this TP rank. Matches MooncakeStore._get_mha_buffer_meta.
         return (
             self.layers
-            * (self.kv_heads // self.tp_size)
+            * max(1, self.kv_heads // self.tp_size)
             * self.head_dim
             * self.dtype_bytes
             * self.page_size
@@ -83,14 +83,18 @@ class SharedStorage:
         capacity_bytes,
         bandwidth_bytes_per_s,
         latency_us=100,
+        eviction_mode="record_remove",
     ):
         if capacity_bytes < 1 or bandwidth_bytes_per_s <= 0 or latency_us < 0:
             raise ValueError("invalid storage capacity, bandwidth or latency")
+        if eviction_mode not in ("record_remove", "master"):
+            raise ValueError("eviction_mode must be record_remove or master")
         self.recorder = recorder
         self.layout = layout
         self.capacity = capacity_bytes
         self.bandwidth = bandwidth_bytes_per_s
         self.latency_us = latency_us
+        self.eviction_mode = eviction_mode
         self.entries = OrderedDict()
         self.used_bytes = 0
         self.now_us = 0
@@ -151,8 +155,9 @@ class SharedStorage:
             hit_pages = min(hit_pages, rank_hits // 2)
         return hit_pages
 
-    def _reserve(self, client, new_keys, protected):
-        needed = len(new_keys) * self.layout.object_bytes
+    def _reserve(self, client, new_keys, protected, sizes=None):
+        sizes = sizes or {key: self.layout.object_bytes for key in new_keys}
+        needed = sum(sizes[key] for key in new_keys)
         victims = []
         freed = 0
         for key, entry in self.entries.items():
@@ -165,17 +170,94 @@ class SharedStorage:
             raise RuntimeError("L3 has insufficient unpinned capacity for this backup")
         dependencies = []
         if victims:
-            dependencies.append(
-                self.recorder.emit(self.now_us, client, "BatchRemove", keys=victims)
-            )
+            # In master mode these are only the simulator's LRU victims. The
+            # replayed master evicts autonomously and may choose other keys.
+            if self.eviction_mode == "record_remove":
+                dependencies.append(
+                    self.recorder.emit(self.now_us, client, "BatchRemove", keys=victims)
+                )
             for key in victims:
                 self.used_bytes -= self.entries.pop(key).size
             self.stats["evicted_keys"] += len(victims)
         for key in new_keys:
-            self.entries[key] = Entry(self.layout.object_bytes)
-            self.used_bytes += self.layout.object_bytes
+            self.entries[key] = Entry(sizes[key])
+            self.used_bytes += sizes[key]
         self.stats["peak_bytes"] = max(self.stats["peak_bytes"], self.used_bytes)
         return dependencies
+
+    def lookup_keys(self, client, keys):
+        self.recorder.emit(self.now_us, client, "BatchExistKey", keys=keys)
+        found = []
+        for key in keys:
+            entry = self.entries.get(key)
+            self.stats["lookup_keys"] += 1
+            ready = entry is not None and not entry.pending
+            found.append(int(ready))
+            if ready:
+                self.stats["hit_keys"] += 1
+                self.entries.move_to_end(key)
+            elif entry is not None:
+                self.stats["pending_keys"] += 1
+        return found
+
+    def write_keys(self, client, keys, sizes, protected=None):
+        sizes = dict(zip(keys, sizes))
+        new_keys = [key for key in keys if key not in self.entries]
+        dependencies = self._reserve(client, new_keys, protected or set(keys), sizes)
+        max_slice = (4 << 20) - 16
+        value_slices = []
+        for key in keys:
+            whole, remainder = divmod(sizes[key], max_slice)
+            value_slices.append(
+                [max_slice] * whole + ([remainder] if remainder else [])
+            )
+        fields = (
+            {"value_sizes": [sizes[key] for key in keys]}
+            if all(len(slices) == 1 for slices in value_slices)
+            else {"value_slices": value_slices}
+        )
+        start = self.recorder.emit(
+            self.now_us,
+            client,
+            "BatchPutStart",
+            keys=keys,
+            depends_on=dependencies,
+            **fields,
+        )
+        done = self._transfer_end("write", sum(sizes[key] for key in new_keys))
+
+        def finish():
+            for key in new_keys:
+                self.entries[key].pending = False
+            self.stats["written_keys"] += len(new_keys)
+            self.recorder.emit(
+                self.now_us, client, "BatchPutEnd", keys=keys, put_start=start
+            )
+
+        self._schedule(done, finish)
+        return done
+
+    def read_keys(self, client, keys):
+        found = []
+        pinned = []
+        for key in keys:
+            entry = self.entries.get(key)
+            ready = entry is not None and not entry.pending
+            found.append(ready)
+            if ready:
+                entry.pins += 1
+                pinned.append(key)
+                self.entries.move_to_end(key)
+        self.recorder.emit(self.now_us, client, "BatchGetReplicaList", keys=keys)
+        done = self._transfer_end("read", sum(self.entries[key].size for key in pinned))
+
+        def finish():
+            for key in pinned:
+                self.entries[key].pins -= 1
+            self.stats["read_keys"] += len(pinned)
+
+        self._schedule(done, finish)
+        return done, found
 
     def write(self, instance, hashes):
         completions = []
@@ -210,26 +292,14 @@ class SharedStorage:
             completions.append(done)
         return max(completions, default=self.now_us)
 
-    def read(self, instance, hashes):
+    def read(self, instance, hashes, *, return_hits=False):
         completions = []
+        page_hits = [True] * len(hashes)
         for rank, client in enumerate(self.layout.clients(instance)):
             keys = self.layout.keys(hashes, rank)
-            for key in keys:
-                entry = self.entries.get(key)
-                if entry is None or entry.pending:
-                    raise RuntimeError(
-                        "prefetch target disappeared or is not committed"
-                    )
-                entry.pins += 1
-                self.entries.move_to_end(key)
-            self.recorder.emit(self.now_us, client, "BatchGetReplicaList", keys=keys)
-            done = self._transfer_end("read", len(keys) * self.layout.object_bytes)
-
-            def finish(keys=keys):
-                for key in keys:
-                    self.entries[key].pins -= 1
-                self.stats["read_keys"] += len(keys)
-
-            self._schedule(done, finish)
+            done, found = self.read_keys(client, keys)
+            for i in range(len(hashes)):
+                page_hits[i] &= all(found[2 * i : 2 * i + 2])
             completions.append(done)
-        return max(completions, default=self.now_us)
+        done = max(completions, default=self.now_us)
+        return (done, page_hits) if return_hits else done

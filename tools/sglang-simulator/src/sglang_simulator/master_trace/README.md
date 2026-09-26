@@ -5,14 +5,16 @@ serving instance, with separate L1/L2 caches and a shared logical-time L3 model.
 It exports RPC intent for a separate Mooncake replay tool. No Mooncake master,
 GPU, model weights or payload transfer is used during generation.
 
-The supported layout is homogeneous MHA, BF16, page-first, PP=1, CP=1, with KV
-heads divisible by TP. Each K/V object must fit one Mooncake slice (at most
+The supported layout is homogeneous MHA/GQA, BF16, page-first, PP=1, CP=1, with
+KV heads and TP dividing one another (including replicated KV heads when TP is
+larger). Each K/V object must fit one Mooncake slice (at most
 4 MiB minus 16 bytes for the pinned CacheLib build); larger objects are rejected.
 A singleton real CPU/Gloo group executes native scheduler
 and HiCache decisions; each simulated instance's storage operations expand into
 the physical K/V keys of its TP ranks. TP ranks are not independently simulated.
-MLA, hybrid sidecar pools, group semantics, heterogeneous layouts and failover
-are unsupported. The adapter lives in this SGLang fork; Mooncake requires only
+Qwen3.5/3.8 GDN hybrid models also record their Mamba temporal and convolution
+checkpoint objects. Other hybrid layouts, MLA, group semantics, heterogeneous
+layouts and failover are unsupported. The adapter lives in this SGLang fork; Mooncake requires only
 its versioned output contract, not a dependency on this fork.
 
 ## Generate
@@ -99,16 +101,55 @@ packet-level network model. These limitations must accompany reported results.
 
 Pending L3 writes become visible only at transfer completion. Reads pin resident
 objects; capacity eviction removes unpinned committed objects in LRU order.
+An object missing at read time returns a failed read through the native HiCache
+acknowledgement and fallback path, even if an earlier availability query hit.
 This is an explicit workload policy, not a reproduction of Mooncake's placement
 or eviction algorithms. Model sufficient capacity for correctness runs and
 inspect actual allocation/status counters in replay. Exhaustion with no eligible
 victim fails generation instead of silently inventing a successful write.
 
+Set `storage_eviction_mode` to `master` for autonomous master-eviction pressure
+runs. The simulator still applies its LRU capacity policy to generate subsequent
+request intents, but does not export capacity victims as client `BatchRemove`
+calls. Mounted capacity is unchanged. The real master's background thread must
+select and remove victims; measure its eviction counters and allocation failures.
+Recorded reads may miss and repeated writes may already exist because its
+victims differ from the simulated LRU. This remains fixed-intent replay, without
+feedback from the measured master into the simulator. The default
+`record_remove` preserves explicit simulated removal calls.
+
+Device KV and Mamba payload buffers are meta tensors, as are the simulated host payload
+buffers. Native CPU request/page indices and cache metadata remain allocated.
+This avoids retaining one unused placeholder KV payload for every simulated
+instance; it does not reduce logical cache capacity or recorded value sizes.
+Pinned staging tensors use ordinary CPU memory. Accelerator-only validation is
+bypassed inside the native extra-buffer validator; its cache policy checks remain.
+Missing CPU model-import operators have fail-fast stubs: executing model math is
+an error. These adaptations are confined to this experimental trace driver.
+
 Each MHA page creates K and V objects per TP rank. Each object's bytes are
-`layers * (kv_heads / TP) * head_dim * dtype_bytes * page_size`. Physical key
+`full_attention_layers * max(1, kv_heads / TP) * head_dim * dtype_bytes * page_size`. Physical key
 format is compared against the native MooncakeStore backend in a unit test.
 Per-key write/read dependencies preserve visibility and anti-dependencies;
 concurrent read calls remain independent. PutEnd retains its matching Start.
+
+For the checked Qwen3.8-27B configuration, 16 full-attention layers, 4 KV heads,
+head dimension 256, TP=8 and page size 256 give 2 MiB per K or V object. All
+eight ranks store their physical objects, including replicated heads. The 48
+linear-attention layers contribute an 18 MiB temporal object (FP32) and a
+368,640-byte convolution object (BF16) per rank at each native offload checkpoint.
+Checkpoint placement, trailing-state hit queries and read/write batch boundaries
+come from native HiCache and MooncakeStore. A KV prefix is reusable only at a
+checkpoint boundary restorable on every rank; taking the minimum rank maximum
+would be incorrect when checkpoint sets have holes.
+
+State shapes and dtypes come from SGLang's Mamba configuration helpers. Objects
+larger than the pinned CacheLib client's 4 MiB minus 16 byte slice limit use the
+replay contract's `value_slices`, preserving one logical object across slices.
+The native page transfer path emits KV and sidecar completion acknowledgements
+on the shared virtual clock. The default `max_mamba_cache_size` is 1024; set it
+in cluster configuration to model a different state-slot budget. Long prompts
+are held as compact token arrays; output JSON and token values are unchanged.
 
 Exported v2 traces explicitly register all request and storage clients using
 empty ReMountSegment handshakes, mount configured storage segments in setup,

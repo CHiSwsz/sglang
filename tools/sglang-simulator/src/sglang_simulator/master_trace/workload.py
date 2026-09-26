@@ -12,10 +12,11 @@ import hashlib
 import json
 import math
 import random
+from array import array
 from pathlib import Path
 
 
-def generate(config: dict) -> list[dict]:
+def generate(config: dict, *, compact=False) -> list[dict]:
     rng = random.Random(config.get("seed", 42))
     sessions = config.get("sessions")
     duration = config.get("session_arrival_duration_s")
@@ -101,7 +102,7 @@ def generate(config: dict) -> list[dict]:
             output_len = length(outputs[turn])
             rows.append(
                 {
-                    "prompt": list(prompt),
+                    "prompt": array("I", prompt) if compact else list(prompt),
                     "prompt_len": len(prompt),
                     "output_len": output_len,
                     "timestamp": round(timestamp, 6) if legacy or turn == 0 else None,
@@ -123,11 +124,13 @@ def generate(config: dict) -> list[dict]:
 
 def write_workload(config_path: Path, output: Path):
     config = json.loads(config_path.read_text())
-    rows = generate(config)
+    rows = generate(config, compact=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x", encoding="utf-8") as stream:
         for row in rows:
-            stream.write(json.dumps(row, separators=(",", ":")) + "\n")
+            stream.write(json.dumps(row, separators=(",", ":"), default=list) + "\n")
+    with output.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
     manifest = {
         "format": "autobench"
         if "mean_inter_round_interval_ms" in config
@@ -135,7 +138,7 @@ def write_workload(config_path: Path, output: Path):
         "time_unit": "ms",
         "requests": len(rows),
         "config": config,
-        "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "sha256": digest,
         "response_tokens": "token 1, matching the official CPU simulator sampler",
         "arrival_mode": (
             "legacy fixed offsets; validate causality"

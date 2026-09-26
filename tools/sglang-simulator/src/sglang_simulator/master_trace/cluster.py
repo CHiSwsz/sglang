@@ -21,6 +21,11 @@ from .storage import MHALayout, SharedStorage
 from .trace import TraceRecorder
 
 
+def file_sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 class Cluster:
     def __init__(self, config, rows, output_dir):
         os.environ["SGLANG_SIMULATOR_EXTERNAL_CLOCK"] = "1"
@@ -37,6 +42,10 @@ class Cluster:
 
         install_simulator_hooks()
         import torch
+
+        from .backend import install_simulator_import_stubs
+
+        install_simulator_import_stubs()
         from sglang_simulator.compat import SIMULATOR_SERVER_ARG_OVERRIDES
         from sglang_simulator.simulation.manager import StateManager
         from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
@@ -46,9 +55,10 @@ class Cluster:
         from sglang.srt.runtime_context import SpawnRanks, publish
         from sglang.srt.server_args import PortArgs, ServerArgs
 
-        from .backend import bind_instance
+        from .backend import bind_instance, install_metadata_only_device_payload
 
         torch.set_num_threads(1)
+        install_metadata_only_device_payload()
         self.torch = torch
         self.state_manager = StateManager
         self.scheduler_hook = C_SchedulerHook
@@ -62,11 +72,16 @@ class Cluster:
         self.request_rows = self.timeline.requests
         self.iterations = 0
         model = json.loads((Path(config["model_path"]) / "config.json").read_text())
+        model = model.get("text_config", model)
+        if model.get("dtype", model.get("torch_dtype")) != "bfloat16":
+            raise ValueError("the trace driver currently requires a BF16 model")
         self.layout = MHALayout(
             config["model_name"],
-            model["num_hidden_layers"],
+            model.get("layer_types", []).count("full_attention")
+            if "layer_types" in model
+            else model["num_hidden_layers"],
             model["num_key_value_heads"],
-            model["head_dim"],
+            model.get("head_dim", model["hidden_size"] // model["num_attention_heads"]),
             2,
             config["page_size"],
             config["tp_size"],
@@ -80,6 +95,11 @@ class Cluster:
                 "clock": "unified_discrete_event",
                 "link_model": "full_duplex_aggregate_FIFO",
                 "initial_state": "empty",
+                "device_kv_payload": "meta_tensor; native CPU allocation indices retained",
+                "storage_eviction_mode": config.get(
+                    "storage_eviction_mode", "record_remove"
+                ),
+                "storage_state_semantics": "simulated LRU; replay master may choose different victims and read outcomes",
             }
         )
         clients = [
@@ -96,7 +116,48 @@ class Cluster:
             config["storage_nodes"] * config["storage_bytes_per_node"],
             config["storage_bandwidth_bytes_per_s"],
             config.get("storage_latency_us", 100),
+            eviction_mode=config.get("storage_eviction_mode", "record_remove"),
         )
+        self.storage.sidecar_component_sizes = {}
+        linear_layers = model.get("layer_types", []).count("linear_attention")
+        if linear_layers:
+            from types import SimpleNamespace
+
+            from sglang.srt.configs.mamba_utils import (
+                Mamba2StateShape,
+                mamba2_state_dtype,
+            )
+
+            if model.get("model_type") != "qwen3_5_text":
+                raise ValueError("only Qwen3.5/3.8 GDN hybrid state is supported")
+            state_dtype = mamba2_state_dtype(SimpleNamespace(**model))
+
+            shape = Mamba2StateShape.create(
+                tp_world_size=config["tp_size"],
+                intermediate_size=model["linear_value_head_dim"]
+                * model["linear_num_value_heads"],
+                n_groups=model["linear_num_key_heads"],
+                num_heads=model["linear_num_value_heads"],
+                head_dim=model["linear_value_head_dim"],
+                state_size=model["linear_key_head_dim"],
+                conv_kernel=model["linear_conv_kernel_dim"],
+            )
+            self.storage.sidecar_component_sizes["mamba"] = [
+                linear_layers
+                * math.prod(shape.temporal)
+                * state_dtype.temporal.itemsize,
+                *[
+                    linear_layers * math.prod(conv) * state_dtype.conv.itemsize
+                    for conv in shape.conv
+                ],
+            ]
+            self.recorder.metadata["sidecar_component_sizes"] = (
+                self.storage.sidecar_component_sizes
+            )
+            self.recorder.metadata["sidecar_dtypes"] = {
+                "temporal": str(state_dtype.temporal),
+                "conv": str(state_dtype.conv),
+            }
         kwargs = dict(
             model_path=config["model_path"],
             load_format="dummy",
@@ -117,6 +178,10 @@ class Cluster:
             watchdog_timeout=36000,
             **SIMULATOR_SERVER_ARG_OVERRIDES,
         )
+        if linear_layers:
+            kwargs.update(
+                max_mamba_cache_size=config.get("max_mamba_cache_size", 1024),
+            )
         server_args = ServerArgs(**kwargs)
         publish(
             server_args,
@@ -357,20 +422,21 @@ def main():
     for field in ("model_path", "sim_config_path"):
         config[field] = str((args.config.parent / config[field]).resolve())
     with args.requests.open() as stream:
-        rows = [json.loads(line) for line in stream if line.strip()]
+        rows = []
+        for line in stream:
+            if line.strip():
+                row = json.loads(line)
+                row["prompt"] = array("I", row["prompt"])
+                rows.append(row)
     start = time.monotonic()
     cluster = Cluster(config, rows, args.output_dir)
-    cluster.recorder.metadata["input_sha256"] = hashlib.sha256(
-        args.requests.read_bytes()
-    ).hexdigest()
+    cluster.recorder.metadata["input_sha256"] = file_sha256(args.requests)
     cluster.run()
     resolved_path = args.output_dir / "requests.autobench.jsonl"
     with resolved_path.open("x") as stream:
         for row in cluster.timeline.resolved_rows():
-            stream.write(json.dumps(row, separators=(",", ":")) + "\n")
-    cluster.recorder.metadata["resolved_requests_sha256"] = hashlib.sha256(
-        resolved_path.read_bytes()
-    ).hexdigest()
+            stream.write(json.dumps(row, separators=(",", ":"), default=list) + "\n")
+    cluster.recorder.metadata["resolved_requests_sha256"] = file_sha256(resolved_path)
     cluster.recorder.metadata["storage_stats"] = cluster.storage.stats
     cluster.recorder.write(args.output_dir / "master-rpc.jsonl")
     report = cluster.report()
