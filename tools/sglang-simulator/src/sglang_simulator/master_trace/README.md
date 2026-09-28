@@ -172,13 +172,11 @@ has its own microsecond origin. Serving client count does not determine storage
 capacity. Segment addresses and IDs are supplied by the real replayer, and no
 payload memory is allocated there. Dynamic membership is outside this version.
 
-Heartbeats are explicit Ping events generated offline: one after each client
-registration, then every 1,000,000 microseconds per client during workload, with
-evenly staggered client offsets. This synthetic schedule covers both serving
-and storage clients and ends at the last workload timestamp. Its policy is
-recorded in header metadata. The replayer uses the original Ping timestamps;
-the shared worker pool can delay them. There is no runtime heartbeat generator
-or extension while overdue RPCs drain, so overload may cause real client expiry.
+Heartbeats are not included in exported traces. The Mooncake replayer sends
+Ping independently of recorded business calls, starting after registration and
+continuing until all replay workers finish. This also keeps storage clients
+alive while overdue business RPCs drain. The exporter records this ownership
+in header metadata and does not create heartbeat dependency edges.
 
 Outputs are `master-rpc.jsonl`, `requests.autobench.jsonl` and `simulation.json`,
 including configuration, input/resolved SHA-256, actual arrivals, session metadata,

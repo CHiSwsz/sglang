@@ -9,56 +9,6 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 
-HEARTBEAT_INTERVAL_US = 1_000_000
-
-
-def with_heartbeats(events, interval_us=HEARTBEAT_INTERVAL_US):
-    """Add deterministic Ping intents offline, without changing business events.
-
-    Ping each client after registration, then stagger periodic workload Pings
-    evenly across one interval. Stop at the last recorded workload timestamp;
-    replay delays never extend this finite schedule.
-    """
-    if not isinstance(interval_us, int) or interval_us <= 0:
-        raise ValueError("heartbeat interval must be a positive integer")
-    clients = []
-    previous_ping = {}
-    next_ping = 0
-    for event in events:
-        if event["op"] == "Ping":
-            raise ValueError("input already contains Ping events")
-        if event["phase"] == "workload":
-            if not clients:
-                raise ValueError("workload requires registered clients")
-            while next_ping * interval_us // len(clients) <= event["timestamp_us"]:
-                client = clients[next_ping % len(clients)]
-                ping = {
-                    "id": f"ping-workload-{next_ping}",
-                    "phase": "workload",
-                    "timestamp_us": next_ping * interval_us // len(clients),
-                    "client_id": client,
-                    "op": "Ping",
-                    "stream_id": "heartbeat",
-                    "depends_on": [previous_ping[client]],
-                }
-                yield ping
-                previous_ping[client] = ping["id"]
-                next_ping += 1
-        yield event
-        if event["op"] == "ReMountSegment":
-            client = event["client_id"]
-            clients.append(client)
-            previous_ping[client] = f"ping-setup-{len(clients) - 1}"
-            yield {
-                "id": f"ping-setup-{len(clients) - 1}",
-                "phase": "setup",
-                "timestamp_us": event["timestamp_us"],
-                "client_id": client,
-                "op": "Ping",
-                "stream_id": "heartbeat",
-                "depends_on": [event["id"]],
-            }
-
 
 class TraceRecorder:
     def __init__(self, metadata: dict):
@@ -169,11 +119,9 @@ class TraceRecorder:
         phase_order = {"setup": 0, "workload": 1, "teardown": 2}
         events.sort(key=lambda e: (phase_order[e["phase"]], e["timestamp_us"]))
         self.metadata["heartbeats"] = {
-            "source": "offline_synthetic",
-            "interval_us": HEARTBEAT_INTERVAL_US,
-            "setup": "one Ping after each registration",
-            "workload": "periodic per client with evenly staggered offsets",
-            "end": "last workload timestamp; no extension during replay",
+            "source": "replayer_background",
+            "recorded": False,
+            "lifetime": "registration through completion of all replay workers",
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("x", encoding="utf-8") as stream:
@@ -188,5 +136,5 @@ class TraceRecorder:
                 )
                 + "\n"
             )
-            for event in with_heartbeats(events):
+            for event in events:
                 stream.write(json.dumps(event, separators=(",", ":")) + "\n")
