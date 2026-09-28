@@ -91,6 +91,20 @@ prefetch; native prefix hashing and storage batch boundaries are retained.
 
 ## Timing, state and lifecycle
 
+The adapter uses `greenlet` to retain native synchronous call stacks for the
+backup, prefetch-query and prefetch-read flows. A storage read or write suspends
+its flow until the modeled transfer completes; only then can that flow submit
+its next batch. Other flows keep progressing on the same logical clock. The
+expanded TP ranks join at each blocking call boundary; they are not independent
+schedulers. Metadata RPC latency during generation is zero.
+
+Every workload RPC carries `stream_id` and a completion dependency on the
+previous RPC in the same `(client_id, stream_id)`, in addition to key-order
+dependencies. Delayed PutEnd callbacks retain their originating stream. These
+edges preserve serial flow order when metadata calls take real time in replay.
+A consumer may additionally serialize all streams sharing a client, which can
+delay calls even when their recorded timestamps differ.
+
 One discrete-event clock orders all instances and storage completions. Scheduler
 CPU overhead is explicitly zero instead of the generator's wall-clock runtime.
 The real GPU is replaced by the official simulator's modeled batch duration.

@@ -10,6 +10,7 @@ dependencies = [
     "numpy",
     "scikit-learn",
     "joblib",
+    "greenlet>=3.0",
 ]
 
 [project.optional-dependencies]

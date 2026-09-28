@@ -6,6 +6,7 @@ of serving traffic, and teardown cannot race unfinished writes or lookups.
 """
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 HEARTBEAT_INTERVAL_US = 1_000_000
@@ -21,6 +22,7 @@ def with_heartbeats(events, interval_us=HEARTBEAT_INTERVAL_US):
     if not isinstance(interval_us, int) or interval_us <= 0:
         raise ValueError("heartbeat interval must be a positive integer")
     clients = []
+    previous_ping = {}
     next_ping = 0
     for event in events:
         if event["op"] == "Ping":
@@ -29,24 +31,31 @@ def with_heartbeats(events, interval_us=HEARTBEAT_INTERVAL_US):
             if not clients:
                 raise ValueError("workload requires registered clients")
             while next_ping * interval_us // len(clients) <= event["timestamp_us"]:
-                yield {
+                client = clients[next_ping % len(clients)]
+                ping = {
                     "id": f"ping-workload-{next_ping}",
                     "phase": "workload",
                     "timestamp_us": next_ping * interval_us // len(clients),
-                    "client_id": clients[next_ping % len(clients)],
+                    "client_id": client,
                     "op": "Ping",
+                    "stream_id": "heartbeat",
+                    "depends_on": [previous_ping[client]],
                 }
+                yield ping
+                previous_ping[client] = ping["id"]
                 next_ping += 1
         yield event
         if event["op"] == "ReMountSegment":
             client = event["client_id"]
             clients.append(client)
+            previous_ping[client] = f"ping-setup-{len(clients) - 1}"
             yield {
                 "id": f"ping-setup-{len(clients) - 1}",
                 "phase": "setup",
                 "timestamp_us": event["timestamp_us"],
                 "client_id": client,
                 "op": "Ping",
+                "stream_id": "heartbeat",
                 "depends_on": [event["id"]],
             }
 
@@ -59,15 +68,33 @@ class TraceRecorder:
         self._storage = []
         self._writers = {}
         self._readers = {}
+        self.current_stream = None
+        self._stream_tail = {}
+
+    @contextmanager
+    def stream(self, name):
+        previous = self.current_stream
+        self.current_stream = name
+        try:
+            yield
+        finally:
+            self.current_stream = previous
 
     def emit(self, timestamp_us, client_id, op, *, phase="workload", **fields):
         if timestamp_us < 0:
             raise ValueError("negative event time")
         event_id = f"e{self._counter}"
         self._counter += 1
+        dependencies = set(fields.get("depends_on", ()))
+        if phase == "workload":
+            name = self.current_stream or "default"
+            fields["stream_id"] = name
+            stream = (client_id, name)
+            if stream in self._stream_tail:
+                dependencies.add(self._stream_tail[stream])
+            self._stream_tail[stream] = event_id
         keys = fields.get("keys", ())
         if keys:
-            dependencies = set(fields.get("depends_on", ()))
             read = op in ("BatchExistKey", "BatchGetReplicaList")
             for key in keys:
                 if key in self._writers:
@@ -77,10 +104,10 @@ class TraceRecorder:
                 else:
                     dependencies.update(self._readers.pop(key, ()))
                     self._writers[key] = event_id
-            if dependencies:
-                fields["depends_on"] = sorted(
-                    dependencies, key=lambda value: int(value[1:])
-                )
+        if dependencies:
+            fields["depends_on"] = sorted(
+                dependencies, key=lambda value: int(value[1:])
+            )
         self.events.append(
             {
                 "id": event_id,

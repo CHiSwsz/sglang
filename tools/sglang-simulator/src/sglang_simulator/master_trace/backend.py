@@ -2,6 +2,8 @@
 
 from queue import Empty
 
+from greenlet import getcurrent, greenlet
+
 from .storage import SharedStorage
 
 _construction_context = None
@@ -136,6 +138,21 @@ class RecordingBackend:
         self.instance = instance
         self.last_completion_us = 0
         self.registered_pools = {}
+        self.active_flow = None
+        self.flows = {}
+
+    def run_flow(self, name, action):
+        flow = self.flows.get(name)
+        if flow is None or flow.task.dead:
+            flow = StorageFlow(self, name, action)
+            self.flows[name] = flow
+            flow.resume()
+
+    def wait_until(self, done):
+        if done > self.storage.now_us:
+            if self.active_flow is None:
+                raise RuntimeError("blocking storage call requires an execution flow")
+            getcurrent().parent.switch(done)
 
     def register_mem_pool_host(self, pool):
         self.pool = pool
@@ -197,6 +214,7 @@ class RecordingBackend:
 
     def batch_set(self, keys, values=None, extra_info=None):
         self.last_completion_us = self.storage.write(self.instance, keys)
+        self.wait_until(self.last_completion_us)
         return True
 
     def batch_set_v1(self, keys, host_indices, extra_info=None):
@@ -212,6 +230,7 @@ class RecordingBackend:
     def _sidecar_io(self, transfers, write):
         results = {}
         for transfer in transfers:
+            completion = self.storage.now_us
             sizes = self.storage.sidecar_component_sizes[str(transfer.name)]
             page_hits = [True] * len(transfer.keys)
             for rank, client in enumerate(self.storage.layout.clients(self.instance)):
@@ -233,24 +252,52 @@ class RecordingBackend:
                             [keys[i] for i in missing],
                             [sizes[i % multiplier] for i in missing],
                         )
-                        self.last_completion_us = max(self.last_completion_us, done)
+                        completion = max(completion, done)
                 else:
                     done, found = self.storage.read_keys(client, keys)
                     for i in range(len(page_hits)):
                         page_hits[i] &= all(
                             found[i * multiplier : (i + 1) * multiplier]
                         )
-                    self.last_completion_us = max(self.last_completion_us, done)
+                    completion = max(completion, done)
+            self.last_completion_us = completion
+            # A blocking native transfer must finish before the next pool or
+            # batch in this flow is submitted. Logical TP ranks join here.
+            self.wait_until(completion)
             results[transfer.name] = page_hits
         return results
 
     def batch_get_v1(self, keys, host_indices, extra_info=None):
         done, hits = self.storage.read(self.instance, keys, return_hits=True)
         self.last_completion_us = max(self.last_completion_us, done)
+        self.wait_until(done)
         return hits
 
     def close(self):
         pass
+
+
+class StorageFlow:
+    """Suspend a native synchronous call stack on the shared logical clock."""
+
+    def __init__(self, backend, name, action):
+        self.backend = backend
+        self.name = name
+        self.task = greenlet(action)
+
+    def resume(self):
+        backend = self.backend
+        previous = backend.active_flow
+        backend.active_flow = self
+        try:
+            with backend.storage.recorder.stream(self.name):
+                done = self.task.switch()
+        finally:
+            backend.active_flow = previous
+        if not self.task.dead:
+            if done <= backend.storage.now_us:
+                raise RuntimeError("storage flow must resume in the future")
+            backend.storage._schedule(done, self.resume)
 
 
 def _drain(queue):
@@ -280,17 +327,14 @@ def install_recording_controller(target):
         if not self.enable_storage:
             return
         backend = self.storage_backend
-        for operation in _drain(self.backup_queue):
-            backend.last_completion_us = backend.storage.now_us
-            self._page_backup(operation)  # Native hashing, batching and policy.
-            completed = operation.completed_tokens
-            operation.completed_tokens = 0
 
-            def acknowledge(operation=operation, completed=completed):
-                operation.completed_tokens = completed
+        def consume():
+            for operation in _drain(self.backup_queue):
+                self._page_backup(operation)
+                # Native synchronous calls have now finished in simulated time.
                 self.ack_backup_queue.put(operation)
 
-            backend.storage._schedule(backend.last_completion_us, acknowledge)
+        backend.run_flow("backup", consume)
 
     def prefetch(self):
         if not self.enable_storage:
@@ -301,48 +345,47 @@ def install_recording_controller(target):
 
         backend = self.storage_backend
 
-        class TimedAcknowledgements:
+        class Acknowledgements:
             def put(queue, ack):
-                def acknowledge():
-                    self._reduce_prefetch_ack(ack)
-                    self.ack_prefetch_queue.put(ack)
+                self._reduce_prefetch_ack(ack)
+                self.ack_prefetch_queue.put(ack)
 
-                backend.storage._schedule(backend.last_completion_us, acknowledge)
+        def query():
+            for operation in _drain(self.prefetch_queue):
+                if operation.is_terminated():
+                    self.prefetch_revoke_queue.put(operation.request_id)
+                    continue
+                hashes, hits = self._storage_hit_query(operation)
+                operation.hash_value = hashes[: hits // self.page_size]
+                operation.storage_hit_count = hits
+                self.prefetch_hit_queue.put(operation)
 
-        for operation in _drain(self.prefetch_queue):
-            if operation.is_terminated():
-                self.prefetch_revoke_queue.put(operation.request_id)
-                continue
-            hashes, hits = self._storage_hit_query(operation)
-            operation.hash_value = hashes[: hits // self.page_size]
-            operation.storage_hit_count = hits
-            self.prefetch_hit_queue.put(operation)
-
-        for operation in _drain(self.prefetch_buffer):
-            if operation.is_terminated():
-                self.ack_prefetch_queue.put(
-                    PrefetchAck(
-                        rid=operation.request_id,
-                        operation=operation,
-                        completed_req=True,
+        def read():
+            for operation in _drain(self.prefetch_buffer):
+                if operation.is_terminated():
+                    self.ack_prefetch_queue.put(
+                        PrefetchAck(
+                            rid=operation.request_id,
+                            operation=operation,
+                            completed_req=True,
+                        )
                     )
-                )
-                continue
-            backend.last_completion_us = backend.storage.now_us
-            # Retain native KV batching, trailing checkpoint reads and progressive
-            # ACKs; only replace payload transfer and the completion clock.
-            with (
-                patch.object(self, "prefetch_sync_queue", TimedAcknowledgements()),
-                patch.object(self, "page_get_func", self._page_get_zero_copy),
-            ):
-                self._page_transfer(operation)
-                self.prefetch_sync_queue.put(
-                    PrefetchAck(
-                        rid=operation.request_id,
-                        operation=operation,
-                        completed_req=True,
+                    continue
+                with (
+                    patch.object(self, "prefetch_sync_queue", Acknowledgements()),
+                    patch.object(self, "page_get_func", self._page_get_zero_copy),
+                ):
+                    self._page_transfer(operation)
+                    self.prefetch_sync_queue.put(
+                        PrefetchAck(
+                            rid=operation.request_id,
+                            operation=operation,
+                            completed_req=True,
+                        )
                     )
-                )
+
+        backend.run_flow("prefetch_query", query)
+        backend.run_flow("prefetch_read", read)
 
     target.handle_backup_operation = backup
     target.handle_prefetch_operation = prefetch

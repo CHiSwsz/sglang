@@ -124,8 +124,14 @@ class SharedStorage:
         return self.jobs[0][0] if self.jobs else None
 
     def _schedule(self, when, callback):
+        stream = self.recorder.current_stream
+
+        def in_stream():
+            with self.recorder.stream(stream):
+                callback()
+
         self.sequence += 1
-        heapq.heappush(self.jobs, (when, self.sequence, callback))
+        heapq.heappush(self.jobs, (when, self.sequence, in_stream))
 
     def _transfer_end(self, direction, size):
         start = max(self.now_us + self.latency_us, self.link_ready[direction])
